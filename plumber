@@ -25,7 +25,7 @@ if (parseFloat(process.versions.node) < 10) {
 	exit(0)
 }
 
-program.version('0.2.0')
+program.version('0.2.1')
 
 program
 	.option('-d, --debug', 'turn on debug mode')
@@ -39,6 +39,8 @@ program.parse(process.argv)
 
 const loadEnv = async (environment) => {
 	let env
+	let context = {}
+
 	try {
 		env = require(path.join(environment.path, 'env'))
 	} catch (e) {
@@ -49,17 +51,15 @@ const loadEnv = async (environment) => {
 	require('app-module-path').addPath(path.join(environment.path, 'node_modules'))
 	require.paths = [path.join(environment.path, 'node_modules')]
 
-	context = {}
 	if (env['modules']) {
-		const keys = Object.keys(env['modules'])
-		for (const key of keys) {
-			if (typeof (env['modules'][key]) === 'string') {
+		for (const [key, value] of Object.entries(env['modules'])) {
+			if (typeof key === 'string') {
 				try {
-					context[key] = require(env['modules'][key])
+					context[key] = require(value)
 					if (config.debugMode)
-						console.debug(`plumber: successfully loaded module '${env['modules'][key]}' into context.modules.${key}`)
+						console.debug(`plumber: successfully loaded module '${value}' into context.modules.${key}`)
 				} catch (e) {
-					console.error(`plumber: couldn't load module '${env['modules'][key]}'`)
+					console.error(`plumber: couldn't load module '${value}'`)
 				}
 			} else {
 				console.error('plumber: malformed environment file')
@@ -68,11 +68,9 @@ const loadEnv = async (environment) => {
 		}
 	}
 
-	if (env['context']) {
-		const keys = Object.keys(env['context'])
-		for (const key of keys)
-			context[key] = env['context'][key]
-	}
+	if (env['context'])
+		for (const [key, value] of Object.entries(env['context']))
+			context[key] = value
 
 	if (env['launch-options']) {
 		for (const option of env['launch-options']) {
