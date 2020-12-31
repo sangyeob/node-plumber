@@ -6,10 +6,12 @@ const fs = require('fs')
 const path = require('path')
 const { exit } = require('process')
 const child_process = require('child_process')
+const repl = require('repl')
 
 const { program } = require('commander')
 const inquirer = require('inquirer')
 
+let replServer
 
 let config = {
 	debugMode: false,
@@ -23,7 +25,7 @@ if (parseFloat(process.versions.node) < 10) {
 	exit(0)
 }
 
-program.version('0.1.0')
+program.version('0.2.0')
 
 program
 	.option('-d, --debug', 'turn on debug mode')
@@ -35,77 +37,100 @@ program
 
 program.parse(process.argv)
 
-const loadEnv = (environment) => {
+const loadEnv = async (environment) => {
 	let env
 	try {
 		env = require(path.join(environment.path, 'env'))
-	} catch(e) {
-		console.error(`plumber: could not find 'env.js' file at environment '${ environment.name }'`)
+	} catch (e) {
+		console.error(`plumber: could not find 'env.js' file at environment '${environment.name}'`)
 		return false
 	}
 
 	require('app-module-path').addPath(path.join(environment.path, 'node_modules'))
 	require.paths = [path.join(environment.path, 'node_modules')]
-	const repl = require('repl')
-	
-	let prompt = `${env.name}> `
+
+	context = {}
+	if (env['modules']) {
+		const keys = Object.keys(env['modules'])
+		for (const key of keys) {
+			if (typeof (env['modules'][key]) === 'string') {
+				try {
+					context[key] = require(env['modules'][key])
+					if (config.debugMode)
+						console.debug(`plumber: successfully loaded module '${env['modules'][key]}' into context.modules.${key}`)
+				} catch (e) {
+					console.error(`plumber: couldn't load module '${env['modules'][key]}'`)
+				}
+			} else {
+				console.error('plumber: malformed environment file')
+				return false
+			}
+		}
+	}
+
+	if (env['context']) {
+		const keys = Object.keys(env['context'])
+		for (const key of keys)
+			context[key] = env['context'][key]
+	}
+
+	if (env['launch-options']) {
+		for (const option of env['launch-options']) {
+			let answer
+			if (option.type === "text") {
+				answer = await inquirer.prompt([{
+					type: 'input',
+					name: option['option-name'],
+					message: option['prompt']
+				}])
+			} else if (option.type === "choice") {
+				answer = await inquirer.prompt([{
+					type: 'list',
+					name: option['option-name'],
+					message: option['prompt'],
+					choices: option['choices']
+				}])
+			}
+
+			if (option['formatter'])
+				context[option['option-name']] = option['formatter'](answer[option['option-name']])
+			else
+				context[option['option-name']] = answer[option['option-name']]
+		}
+	}
+
+	if (env['on-load-scripts']) {
+		let index = 0
+		for (const script of env['on-load-scripts']) {
+			if (config.debugMode)
+				console.debug(`Executing on-load-script #${index++}`)
+			await script(context)
+		}
+	}
+
+	let prompt = `${environment.name}> `
 
 	if (env['environment-name'])
 		prompt = `${env['environment-name']}> `
 
-	const replServer = repl.start({ prompt: '' })
+	replServer = repl.start({ prompt: '' })
 	replServer.displayPrompt(false)
 
-	if (env['context']) {
-		if (env['context']['modules']) {
-			const keys = Object.keys(env['context']['modules'])
-			for (const key of keys) {
-				if (typeof (env['context']['modules'][key]) === 'string') {
-					try {
-						replServer.context[key] = require(env['context']['modules'][key])
-						if (config.debugMode)
-							console.debug(`plumber: successfully loaded module '${env['context']['modules'][key]}' into context.modules.${key}`)
-					} catch(e) {
-						console.error(`plumber: couldn't load module '${env['context']['modules'][key]}'`)
-					}
-				} else {
-					console.error('plumber: malformed environment file')
-					return false
-				}
-			}
-		}
-
-		if (env['context']['variables']) {
-			const keys = Object.keys(env['context']['variables'])
-			for (const key of keys)
-				replServer.context[key] = env['context']['variables'][key]
-		}
-
-		if (env['context']['functions']) {
-			const keys = Object.keys(env['context']['functions'])
-			for (const key of keys)
-				replServer.context[key] = env['context']['functions'][key]
-		}
-
-		if (env['context']['on-load-scripts']) {
-			env['context']['on-load-scripts'].forEach((script, index) => {
-				if (config.debugMode)
-					console.debug(`Executing on-load-script #${index}`)
-				script(replServer.context)
-			})
-		}
+	for (const [key, value] of Object.entries(context)) {
+		replServer.context[key] = value
 	}
 
 	replServer.setPrompt(prompt)
 	replServer.displayPrompt(true)
 
-	replServer.on('exit', () => {
-		if (env['context']['on-exit-scripts']) {
-			env['context']['on-exit-scripts'].forEach((script, index) => {
+	replServer.on('exit', async () => {
+		if (env['on-exit-scripts']) {
+			let index = 0
+			for (const script of env['on-exit-scripts']) {
 				if (config.debugMode)
-					console.debug(`Executing on-load-script #${index}`)
-				script(replServer.context)
-			})
+					console.debug(`Executing on-exit-script #${index++}`)
+				await script(replServer.context)
+			}
 		}
 	})
 }
@@ -114,11 +139,11 @@ const updateEnv = (environment, withoutPull = false) => {
 	try {
 		process.chdir(environment.path)
 		child_process.execSync(`git reset --hard`)
-		if(!withoutPull)
+		if (!withoutPull)
 			child_process.execSync(`git pull`)
 		const npmCmd = os.platform().startsWith('win') ? 'npm.cmd' : 'npm'
 		child_process.execSync(`${npmCmd} install`)
-	} catch(e) {
+	} catch (e) {
 		console.error(`plumber: couldn't update environment ${environment.name}`)
 	}
 }
@@ -137,27 +162,26 @@ if (program.dir) {
 }
 
 if (program.install) {
-	/* git clone 방식으로 설치하도록 변경 */
 	process.chdir(config.environmentDirectory)
 	let match, envName
 	let envRegexr = /\/([^/]+)\.git/g
-	while(match = envRegexr.exec(program.install))
+	while (match = envRegexr.exec(program.install))
 		envName = match[1]
-	if(!envName) {
+	if (!envName) {
 		console.error('plumber: cannot find environment name from given git repository')
 		exit(0)
 	}
-	if(fs.existsSync(path.join(config.environmentDirectory, envName))) {
+	if (fs.existsSync(path.join(config.environmentDirectory, envName))) {
 		console.error(`plumber: ${envName} already exists`)
 		exit(0)
 	}
 
-	if(config.debugMode)
-		console.log(`plumber: cloning ${envName}...`)
+	if (config.debugMode)
+		console.debug(`plumber: cloning ${envName}...`)
 	try {
 		child_process.execSync(`git clone ${program.install}`)
 		process.chdir(envName)
-	} catch(e) {
+	} catch (e) {
 		console.error(`plumber: couldn't clone git repository`)
 	}
 
@@ -165,18 +189,17 @@ if (program.install) {
 		name: envName,
 		path: path.join(config.environmentDirectory, envName)
 	}, true)
-	// child_process.execSync(``)
-	// const npmCmd = os.platform().startsWith('win') ? 'npm.cmd' : 'npm'
-
-	// child_process.execSync(`${npmCmd} install --prefix ${config.environmentDirectory} ${program.install}`)
-	// mv ./node_modules/tablemanager-dev ../
 
 	exit(0)
 }
 
+if (!fs.existsSync(config.environmentDirectory)) {
+	fs.mkdirSync(config.environmentDirectory)
+}
+
 fs.readdirSync(config.environmentDirectory, { withFileTypes: true })
 	.forEach(file => {
-		if(file.isDirectory()) {
+		if (file.isDirectory()) {
 			config.environments.push({
 				name: file.name,
 				path: `${config.environmentDirectory}/${file.name}`,
@@ -223,7 +246,7 @@ if (config.selectedEnvironmentIndex === -1) {
 	}
 }
 
-if(program.update) {
+if (program.update) {
 	inquirer.prompt([{
 		type: 'list',
 		name: 'target',
